@@ -57,6 +57,44 @@ const fn buffer_store_dword(vdata: u8, srsrc: u8, byte_off: u16) -> [u32; 2] {
     ]
 }
 
+#[test]
+fn bindless_scalar_reads_match_the_buffer_view() {
+    use super::host::Stride;
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+
+    let Ok(host) = Host::new(false).or_else(|_| Host::new(true)) else {
+        eprintln!("no SM 6.6 device; skipped");
+        return;
+    };
+    let data = [0x12345678, 0x87654321];
+    for mixed in [false, true] {
+        let mut body = vec![
+            s_mov_b32(7, 0x80),    // High half of the resource heap base.
+            0x8F02_8500,           // s_lshl_b32 s2, s0, 5
+            0xF408_0303, 0x0400_0000, // s_load_dwordx4 s[12:15], s[6:7], s2
+            0xF420_0406, 0xFA00_0004, // s_buffer_load_dword s16, s[12:15], 4
+            vop1(1, 0, sgpr(16)),
+        ];
+        let view = if mixed {
+            body.extend([0xE030_0000, 0x8003_0100]); // buffer_load_dword v1, off, s[12:15], 0
+            body.extend(buffer_store_dword(1, 8, 4));
+            View::Buffer { data: &data, stride: Stride::Raw }
+        } else {
+            View::Cbv(&data)
+        };
+        let shader = build_cs(&body, true);
+        let (root, pso) = host.compute_pipeline(&shader).unwrap();
+        // s0 selects slot 1. The output UAV table begins at slot 0.
+        let result = host.dispatch(&root, &pso, &Dispatch {
+            roots: vec![(0, Root::Constants(vec![1, 0, 0, 0, 0]))],
+            views: &[View::RawUav(2), view],
+            samplers: &[],
+            groups: [1; 3],
+        }).unwrap();
+        assert_eq!(result[0], [data[1], if mixed { data[0] } else { 0 }]);
+    }
+}
+
 const fn sgpr(n: u8) -> u16 {
     n as u16
 }
@@ -69,6 +107,10 @@ const fn vgpr(n: u8) -> u16 {
 /// 4 dwords of root constants in `s0..s3`, runs `body` (leaving its result in
 /// `v0`), and stores `v0` to dword 0 of the raw UAV at heap index 0.
 fn build_valu_cs(body: &[u32]) -> HostShader {
+    build_cs(body, false)
+}
+
+fn build_cs(body: &[u32], bindless: bool) -> HostShader {
     let mut words = Vec::new();
     // s[4:5] = descriptor table address (heap index 0 -> byte offset 0).
     words.push(s_mov_b32(5, 0x80)); // inline constant 0
@@ -83,7 +125,7 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
     words.push(S_ENDPGM);
 
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-    let native = NativeProgram {
+    let mut native = NativeProgram {
         stage: HwStage::Cs,
         wave64: false,
         vgprs: 8,
@@ -122,6 +164,15 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
         code,
     };
 
+    if bindless {
+        native.layout.push(RootParam {
+            root: RootType::ResourceHeap, user_data: 6, slot: 0, sgprs: 1,
+            base_register: 0, table_offset_dwords: 0,
+        });
+        if let StageIo::Cs(cs) = &mut native.io {
+            cs.rsrc2 = 7 << 1;
+        }
+    }
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     let res = resource::track(&p, &native.layout, native.stage).expect("resource::track");
     let io = io::raise(&p, &native).expect("io::raise");
@@ -159,6 +210,13 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
     shader
 }
 
+/// One GPU test at a time. With these tests on the hardware adapter and WARP
+/// from several test threads at once, now and then none of their dispatches
+/// ever completes and the test binary hangs; and two GPU tests at once on
+/// WARP can end the test process with an access violation. Other GPU test
+/// modules take this lock too.
+pub(super) static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Runs `shader` on every available SM 6.6 host (hardware GPU and WARP) for
 /// each 4-dword input set and invokes `check(backend, case_index, inputs, result_dword)`.
 fn run_cases(
@@ -166,6 +224,7 @@ fn run_cases(
     cases: &[[u32; 4]],
     mut check: impl FnMut(&str, usize, [u32; 4], u32),
 ) {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let mut ran = 0;
     for (label, warp) in [("hardware", false), ("warp", true)] {
         let Ok(host) = Host::new(warp) else {

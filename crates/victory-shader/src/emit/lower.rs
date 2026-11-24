@@ -151,6 +151,8 @@ struct Lower<'a> {
     user_reads: BTreeMap<u32, UserData>,
     samplers: Vec<[u32; 4]>,
     descriptors: HashMap<(Site, bool), &'a Source>,
+    /// Bindless descriptors whose vector accesses all require a read-only raw buffer.
+    raw_heap_reads: HashSet<(Site, u8)>,
     scalar: HashMap<Site, Address>,
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
@@ -323,6 +325,38 @@ fn unsupported(offset: usize, what: Why) -> Stop {
     Stop::Fail(ShaderError::Unsupported { offset, what })
 }
 
+/// Heap descriptors have no UsedResource entry. A scalar load through the
+/// same descriptor as a byte-addressed vector load must use the same SRV.
+/// Keep scalar-only, typed, indexed and ambiguous accesses on their existing paths.
+fn raw_heap_reads(x: &Parts<'_>) -> HashSet<(Site, u8)> {
+    let heap_loads: HashSet<_> = x.res.scalar.iter().filter_map(|(load, address)| {
+        let root = x.native.layout.get(address.param)?;
+        (root.root == RootType::ResourceHeap).then_some(*load)
+    }).collect();
+    let mut raw_only = HashMap::new();
+    if !heap_loads.is_empty() {
+        for d in &x.res.descriptors {
+            let inst = &x.p.blocks[d.site.0].insts[d.site.1];
+            if inst.name().starts_with("s_buffer_load_dword") {
+                continue;
+            }
+            // A tbuffer load with an instruction-specified format fetches
+            // raw bytes and unpacks them in format_load.
+            let raw = d.role == Role::Resource && matches!(d.source, Source::Loaded { .. })
+                && matches!(inst.fields, Fields::Buffer { idxen: false, .. })
+                && (matches!(inst.name(), "buffer_load_dword" | "buffer_load_dwordx2" |
+                    "buffer_load_dwordx3" | "buffer_load_dwordx4")
+                    || inst.name().starts_with("tbuffer_load_format_"));
+            for src in d.source.leaves() {
+                if let Source::Loaded { load, first } = *src && heap_loads.contains(&load) {
+                    *raw_only.entry((load, first)).or_insert(true) &= raw;
+                }
+            }
+        }
+    }
+    raw_only.into_iter().filter_map(|(key, raw)| raw.then_some(key)).collect()
+}
+
 impl<'a> Lower<'a> {
     fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>) -> Self {
         let p = x.p;
@@ -450,6 +484,7 @@ impl<'a> Lower<'a> {
             user_data: None,
             user_reads: BTreeMap::new(),
             samplers: Vec::new(),
+            raw_heap_reads: raw_heap_reads(x),
             descriptors: x
                 .res
                 .descriptors
@@ -2764,7 +2799,9 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
-        if matches!(kind, Some(u) if u.kind == ResourceType::Srv) {
+        let raw_heap = matches!(src, Source::Loaded { load, first }
+            if self.raw_heap_reads.contains(&(*load, *first)));
+        if matches!(kind, Some(u) if u.kind == ResourceType::Srv) || raw_heap {
             let h = self.handle(site, src, false, (11, 0))?;
             for k in 0..count {
                 let off = self.s.m.i32(4 * k);
