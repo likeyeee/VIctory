@@ -51,6 +51,12 @@ pub(crate) struct IndexView {
     format: u32,
 }
 
+struct CachedTable {
+    first: u32,
+    cbv_sources: Vec<std::ops::Range<usize>>,
+    checked_copies: usize,
+}
+
 /// What one title list has set, and what its host list was last given.
 #[derive(Default)]
 pub(crate) struct State {
@@ -71,9 +77,8 @@ pub(crate) struct State {
     /// Graphics, compute.
     host_roots: [usize; 2],
     host_heaps: [usize; 2],
-    /// Tables made afresh in this list: (table, what it holds) → first
-    /// dynamic slot.
-    fresh_tables: std::collections::HashMap<(u64, u64), u32>,
+    /// Fresh tables indexed by title address and descriptor contents.
+    fresh_tables: std::collections::HashMap<(u64, u64), CachedTable>,
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
@@ -685,22 +690,24 @@ impl State {
                 }
                 (table, h.finish())
             };
-            if let Some(&first) = self.fresh_tables.get(&key) {
+            if let Some(cached) = self.fresh_tables.get_mut(&key)
+                && list.cbvs_unchanged(&cached.cbv_sources, &mut cached.checked_copies)
+            {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
                         readable(list, u, &view);
                     }
                 }
-                made.push((slot, first * 32));
+                made.push((slot, cached.first * 32));
                 continue;
             }
             let Some(first) = host.dynamic(n) else {
                 continue;
             };
-            self.fresh_tables.insert(key, first);
             self.dynamic
                 .push((std::ptr::from_ref(heap) as usize, first, n));
+            let mut cbv_sources = Vec::new();
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
             for k in 0..n {
@@ -714,6 +721,10 @@ impl State {
                         };
                         list.defer_fill(to, address as *const u8, size as usize);
                         host.constant_at(index, gpu, size);
+                        if size != 0 {
+                            let start = address as usize;
+                            cbv_sources.push(start..start.saturating_add(size as usize));
+                        }
                     }
                     Some(view) => {
                         host.make_at(index, &view);
@@ -729,6 +740,14 @@ impl State {
                     }
                 }
             }
+            self.fresh_tables.insert(
+                key,
+                CachedTable {
+                    first,
+                    cbv_sources,
+                    checked_copies: list.title_copy_count(),
+                },
+            );
             made.push((slot, first * 32));
         }
         made
@@ -1180,3 +1199,6 @@ pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
     // SAFETY: an open list.
     unsafe { list.list.OMSetStencilRef(reference) };
 }
+
+#[cfg(test)]
+mod tests;

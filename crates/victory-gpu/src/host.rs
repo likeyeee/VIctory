@@ -394,6 +394,8 @@ enum Step {
 struct Deferred {
     /// Destination, source, bytes.
     copies: Vec<Step>,
+    /// Title byte ranges changed by CPU copies in this recording, in command order.
+    title_copies: Vec<std::ops::Range<usize>>,
     uploads: Vec<ID3D12Resource>,
     /// Host objects the list's commands name (pipelines, root signatures,
     /// descriptor heaps): the title may release its objects before it
@@ -1012,11 +1014,36 @@ impl HostList {
 
     /// Copies `len` bytes from `src` to `dst` when the list is submitted.
     pub(crate) fn defer_copy(&self, dst: *mut u8, src: *const u8, len: usize) {
+        self.record_title_copy(dst as usize, len, Step::Copy(dst as usize, src as usize, len));
+    }
+
+    fn record_title_copy(&self, dst: usize, len: usize, step: Step) {
         let mut deferred = self.deferred();
-        deferred
-            .copies
-            .push(Step::Copy(dst as usize, src as usize, len));
+        deferred.copies.push(step);
+        if len != 0 {
+            deferred.title_copies.push(dst..dst.saturating_add(len));
+        }
         deferred.refreshed.clear();
+    }
+
+    pub(crate) fn title_copy_count(&self) -> usize {
+        self.deferred().title_copies.len()
+    }
+
+    /// A table's CBVs contain snapshots taken at their place in the command stream.
+    /// They can be reused until an intervening copy touches any of those source bytes.
+    pub(crate) fn cbvs_unchanged(&self, sources: &[std::ops::Range<usize>], checked: &mut usize) -> bool {
+        if sources.is_empty() {
+            return true;
+        }
+        let deferred = self.deferred();
+        let writes = &deferred.title_copies;
+        let Some(recent) = writes.get(*checked..) else { return false };
+        if recent.iter().any(|w| sources.iter().any(|r| w.start < r.end && r.start < w.end)) {
+            return false;
+        }
+        *checked = writes.len();
+        true
     }
 
     /// Copies `len` bytes of title memory at `src` into the list's upload
@@ -1141,14 +1168,12 @@ impl HostList {
         self.deferred().textures.insert(key)
     }
 
-    /// Runs `work` when the list is submitted, in order with its copies.
-    /// `work` may write title memory (refreshes after it copy again).
-    pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
-        self.deferred().copies.push(Step::Run(Box::new(work)));
-        self.deferred().refreshed.clear();
+    /// Runs a copy with its own mapping checks, in order with the list's other copies.
+    pub(crate) fn defer_title_copy(&self, dst: usize, len: usize, work: impl Fn() + Send + 'static) {
+        self.record_title_copy(dst, len, Step::Run(Box::new(work)));
     }
 
-    /// As [`HostList::defer`], for work that writes only host memory.
+    /// Runs submission-time work that writes only host memory.
     pub(crate) fn defer_host(&self, work: impl Fn() + Send + 'static) {
         self.deferred().copies.push(Step::Host(Box::new(work)));
     }
