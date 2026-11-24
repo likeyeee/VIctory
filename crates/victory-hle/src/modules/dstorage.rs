@@ -821,7 +821,8 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
     let source = read_source(request).map_err(|hr| fail(hr, "reading the source"))?;
     // The console's order: zlib first, then BCPack.
     let source = if bc != 0 && options & ZLIB != 0 {
-        let mut packed = vec![0; request.intermediate_size as usize];
+        let mut packed = request_buffer(request.intermediate_size as usize)
+            .map_err(|hr| fail(hr, "allocating the intermediate buffer"))?;
         let n = inflate(&source, &mut packed).map_err(|hr| fail(hr, "zlib"))?;
         packed.truncate(n);
         Cow::Owned(packed)
@@ -903,9 +904,17 @@ fn read_source(request: &Request) -> Result<Cow<'static, [u8]>, HRESULT> {
         let bytes = unsafe { std::slice::from_raw_parts(request.source.cast(), size) };
         return Ok(Cow::Borrowed(bytes));
     }
-    let mut bytes = vec![0; size];
+    let mut bytes = request_buffer(size)?;
     read_into(request, &mut bytes)?;
     Ok(Cow::Owned(bytes))
+}
+
+/// A worker reports a failed staging allocation through the request's status.
+fn request_buffer(len: usize) -> Result<Vec<u8>, HRESULT> {
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(len).map_err(|_| E_OUTOFMEMORY)?;
+    bytes.resize(len, 0);
+    Ok(bytes)
 }
 
 /// Nanoseconds workers spent reading files, for the debug summary.
@@ -971,7 +980,7 @@ fn into_destination(
     if let Some(mut window) = super::xmem::page_window(pages, offset, len) {
         return fill(window.bytes()).map(drop);
     }
-    let mut data = vec![0; len];
+    let mut data = request_buffer(len)?;
     let n = fill(&mut data)?;
     if super::xmem::write_physical(pages, offset, &data[..n]) {
         Ok(())
@@ -1131,6 +1140,11 @@ mod tests {
 
     fn pattern(n: usize) -> Vec<u8> {
         (0..n).map(|i| (i * 7 + i / 251) as u8).collect()
+    }
+
+    #[test]
+    fn staging_allocation_failure_returns_a_request_error() {
+        assert_eq!(request_buffer(usize::MAX), Err(E_OUTOFMEMORY));
     }
 
     #[test]
