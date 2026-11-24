@@ -370,10 +370,13 @@ struct Entry {
     shadow: Option<Arc<Shadow>>,
 }
 
-/// Title buffers by (start address, resource), with their copy once made.
-static BUFFERS: Mutex<BTreeMap<(u64, usize), Entry>> = Mutex::new(BTreeMap::new());
+mod registry;
+use registry::Registry;
 
-fn buffers() -> std::sync::MutexGuard<'static, BTreeMap<(u64, usize), Entry>> {
+/// Title buffers by (start address, resource), with their copy once made.
+static BUFFERS: Mutex<Registry> = Mutex::new(Registry::new());
+
+fn buffers() -> std::sync::MutexGuard<'static, Registry> {
     BUFFERS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -398,17 +401,12 @@ pub(crate) fn unregister(resource: usize, start: u64) {
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
     let mut map = buffers();
-    let key = map
-        .range(..=(address, usize::MAX))
-        .rev()
-        .take(64)
-        .find(|(_, e)| e.end >= end)
-        .map(|(k, _)| *k);
+    let key = map.containing(address, end);
     let Some(key) = key else {
         drop(map);
         return loose(address, end);
     };
-    let entry = map.get_mut(&key)?;
+    let entry = map.entries.get_mut(&key)?;
     if entry.shadow.is_none() {
         let len = entry.end - key.0;
         // Rounded up so that views ending in the buffer's last 256 bytes fit.
